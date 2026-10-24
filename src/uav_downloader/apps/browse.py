@@ -1605,8 +1605,15 @@ class ModernApp(ctk.CTk):
         self.after(30, self._drain_ui_callbacks)
         # Start periodic refresh for downloads
         self._refresh_downloads()
-        # Start clipboard monitor (main-thread safe)
-        self._clp_text = ''
+        # Start clipboard monitor (main-thread safe). Seed with whatever's
+        # already on the clipboard, not '' - the OS clipboard outlives this
+        # process, so treating pre-existing content as "new" on every launch
+        # would re-add the same URLs after every restart (e.g. right after
+        # the user clears the queue, if nothing has copied anything since).
+        try:
+            self._clp_text = self.clipboard_get()
+        except tk.TclError:
+            self._clp_text = ''
         self._clipboard_poll()
 
         # Tk rejects worker-thread ``after`` calls before mainloop starts.  Defer
