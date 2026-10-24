@@ -19,7 +19,7 @@ except ImportError:
 import threading as _threading
 from urllib.parse import quote, urlsplit, urljoin, parse_qsl, urlencode
 from uav_downloader.sites.base import *
-from uav_downloader.sites.base import _get_session
+from uav_downloader.sites.base import _get_session, _variant_height_bw
 from uav_downloader.sites.missav import _unpack_js_eval
 from bs4 import BeautifulSoup
 from uav_downloader.i18n import sites as site_i18n
@@ -398,6 +398,25 @@ class SiteSupJav(M3U8Crawler):
                 return media_url, source_headers
         return _valid_hls_url(_extract_packed_m3u8(response.text)), source_headers
 
+    def _probe_source_height(self, scraper, media_url, source_headers):
+        """Best-effort tallest variant height from one resolved mirror's own
+        master m3u8 - used only to rank mirrors in get_url_infos (same
+        technique probe_resolution.py uses on whichever source is already
+        chosen). Returns None, never raises, on any failure - including a
+        mirror whose playlist is single-quality and so has no
+        #EXT-X-STREAM-INF variants to read a height from."""
+        try:
+            response = scraper.get(
+                media_url, headers=source_headers, timeout=15,
+                **config.proxy_request_kwargs())
+            if response.status_code != 200 or '#EXTM3U' not in (response.text or ''):
+                return None
+            m3u8obj = m3u8.loads(response.text, uri=media_url)
+            heights = [h for h, _bw in (_variant_height_bw(p) for p in (m3u8obj.playlists or [])) if h]
+            return max(heights) if heights else None
+        except Exception:
+            return None
+
     def get_url_infos(self):
         self._direct_url = None
         self._direct_referer = None
@@ -436,6 +455,27 @@ class SiteSupJav(M3U8Crawler):
             if not self._direct_url and not self._hls_sources:
                 raise Exception("此影片目前無可用下載來源（頁面來源 " + ', '.join(servers) +
                                 "；來源失效、存取受限或播放器改版）")
+
+            # SupJav's mirrors are independent encodes, not just redundant
+            # hosts for the same stream - one mirror topping out at 720p
+            # while another has 1080p for the same scene happens in
+            # practice. The loop above keeps every mirror that resolves, in
+            # a fixed priority order that has nothing to do with quality, so
+            # without this, _hls_sources[0] below would just be whichever
+            # mirror happens to come first AND resolve - regardless of what
+            # height it actually serves. Rank by each mirror's own tallest
+            # variant so the best-quality one is tried first; a mirror whose
+            # height can't be determined (single-quality stream, probe
+            # failed) sorts after every mirror with a known height but keeps
+            # its relative position among other unknowns, so behavior is
+            # unchanged when no mirror's quality can be determined at all.
+            if len(self._hls_sources) > 1:
+                ranked = [
+                    (name, url, src_headers, self._probe_source_height(scraper, url, src_headers))
+                    for name, url, src_headers in self._hls_sources
+                ]
+                ranked.sort(key=lambda item: (item[3] is None, -(item[3] or 0)))
+                self._hls_sources = [(name, url, src_headers) for name, url, src_headers, _height in ranked]
 
         title = _extract_title(soup)
         self._targetName = html.unescape(title)
