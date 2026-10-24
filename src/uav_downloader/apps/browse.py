@@ -106,6 +106,16 @@ MAX_PERSIST_ROWS = 1000
 HARD_LOAD_LIMIT = 5000
 CSV_PATH = config.queue_csv_path()
 ERR_BLOCKED = '__cf_blocked__'
+# Local fork addition, not upstream: /mnt/4X/bin/jav-queue-bridge writes
+# clipboard content prefixed with this marker when the Stash "Details
+# Extended" plugin's own "+ Queue" button fires - that scene was already
+# deliberately confirmed/selected on the Stash side, so _clipboard_poll
+# below queues it immediately instead of only pre-filling the URL field
+# for a manual Add click the way an ordinary, unmarked clipboard copy
+# does since upstream's "reviewed queue workflows" change (see git log
+# -S"convenience hint only" on this file). Keep this marker in sync with
+# jav-queue-bridge/bridge.py's own clipboard_copy() caller.
+BRIDGE_CLIPBOARD_MARKER = 'UAV-QUEUE-BRIDGE:v1\n'
 
 SITES = {
     'JableTV': {'browser': JableTVBrowser},
@@ -5711,6 +5721,30 @@ class ModernApp(ctk.CTk):
         finally:
             self._dest_var.set(current)
 
+    # Local fork addition, not upstream - see BRIDGE_CLIPBOARD_MARKER's own
+    # comment. Mirrors _download_url's add_item()+enqueue() pair (just the
+    # direct-video-URL branch; jav-queue-bridge only ever hands over single
+    # scene URLs, never a listing/actress page to crawl) rather than the
+    # old pre-review clipboard code's bare add_item() call, which stopped
+    # being enough on its own once enqueue() became the thing that actually
+    # starts/schedules a task.
+    def _queue_bridge_urls(self, urls):
+        if not urls or not self._preflight_download_destination():
+            return
+        dest = self._dest_var.get() or 'download'
+        resolution = config.get_resolution_pref()
+        filename_template = config.get_filename_template()
+        due = next_schedule_epoch(config.get_download_schedule())
+        existing = {i.url for i in self._dlmgr.get_items()}
+        for url in urls:
+            if url in existing or not M3U8Sites.VaildateUrl(url):
+                continue
+            self._dlmgr.add_item(
+                url, state='等待中', dest=dest, resolution=resolution,
+                filename_template=filename_template)
+            self._dlmgr.enqueue(url, dest, not_before=due)
+            existing.add(url)
+
     # ── Clipboard monitor (main-thread safe) ─────────────────────────
     def _clipboard_poll(self):
         if self._is_closing:
@@ -5725,11 +5759,16 @@ class ModernApp(ctk.CTk):
             clp = self.clipboard_get()
             if clp != self._clp_text:
                 self._clp_text = clp
-                urls = extract_urls(clp)
-                if urls and getattr(self, '_dl_url_var', None) is not None:
-                    # Clipboard monitoring is a convenience hint only.  It no
-                    # longer mutates the persistent queue without a click.
-                    self._dl_url_var.set(urls[0])
+                if clp.startswith(BRIDGE_CLIPBOARD_MARKER):
+                    self._queue_bridge_urls(
+                        extract_urls(clp[len(BRIDGE_CLIPBOARD_MARKER):]))
+                else:
+                    urls = extract_urls(clp)
+                    if urls and getattr(self, '_dl_url_var', None) is not None:
+                        # Clipboard monitoring is a convenience hint only.
+                        # It no longer mutates the persistent queue without
+                        # a click.
+                        self._dl_url_var.set(urls[0])
         except (tk.TclError, Exception):
             pass
         finally:
