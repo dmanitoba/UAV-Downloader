@@ -532,7 +532,10 @@ class SiteSupJav(M3U8Crawler):
         try:
             os.replace(part, out)
         except OSError as exc:
-            raise StorageWriteError(out, exc) from exc
+            if is_destination_fatal(exc):
+                raise StorageWriteError(out, exc) from exc
+            self._safe_remove(part)
+            raise
         except Exception:
             self._safe_remove(part)
             raise

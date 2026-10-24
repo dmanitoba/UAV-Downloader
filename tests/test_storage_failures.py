@@ -197,7 +197,7 @@ def test_remux_disk_full_does_not_start_raw_fallback(monkeypatch, tmp_path):
     job = base.M3U8Crawler.__new__(base.M3U8Crawler)
     job._cancel_job = False
     with pytest.raises(StorageWriteError, match='No space left'):
-        job._remux_to_mp4(str(tmp_path / 'in.ts'), str(tmp_path / 'out.mp4'), str(tmp_path))
+        job._remux_to_mp4(0, str(tmp_path / 'out.mp4'), str(tmp_path))
 
 
 def test_failed_segment_write_never_publishes_truncated_chunk(monkeypatch, tmp_path):

@@ -16,7 +16,8 @@ except Exception:
 import urllib.request
 import m3u8
 from uav_downloader.core import config
-from uav_downloader.core.storage import StorageWriteError, storage_open
+from uav_downloader.core.storage import (
+    StorageWriteError, storage_open, is_destination_fatal)
 from Crypto.Cipher import AES
 from uav_downloader.core.config import headers
 import concurrent.futures
@@ -651,14 +652,18 @@ class M3U8Crawler:
             try:
                 os.makedirs(self._temp_folder, exist_ok=True)
             except OSError as exc:
-                raise StorageWriteError(self._temp_folder, exc) from exc
+                if is_destination_fatal(exc):
+                    raise StorageWriteError(self._temp_folder, exc) from exc
+                raise
 
     def _create_dest_folder(self):
         if not os.path.exists(self._dest_folder):
             try:
                 os.makedirs(self._dest_folder, exist_ok=True)
             except OSError as exc:
-                raise StorageWriteError(self._dest_folder, exc) from exc
+                if is_destination_fatal(exc):
+                    raise StorageWriteError(self._dest_folder, exc) from exc
+                raise
 
     def _get_video_savename(self):
         return os.path.join(self._dest_folder, self._targetName + ".mp4")
@@ -782,7 +787,7 @@ class M3U8Crawler:
             return True
         except OSError as exc:
             import errno
-            if exc.errno != errno.EXDEV:
+            if exc.errno != errno.EXDEV and is_destination_fatal(exc):
                 raise StorageWriteError(dst, exc) from exc
         try:
             with storage_open(src, 'rb') as fi, storage_open(dst, 'wb') as fo:
@@ -822,36 +827,34 @@ class M3U8Crawler:
             workdir = tempfile.mkdtemp(
                 prefix='uav-remux-', dir=self._dest_folder)
         except OSError as exc:
-            raise StorageWriteError(self._dest_folder, exc) from exc
-        merged = os.path.join(workdir, 'merged.ts')
+            if is_destination_fatal(exc):
+                raise StorageWriteError(self._dest_folder, exc) from exc
+            raise
         out_mp4 = os.path.join(workdir, 'out.mp4')
         published = False
         try:
-            remaining = n
-            with storage_open(merged, 'wb') as out:
-                for idx, ts_url in enumerate(self._tsList):
-                    if self._cancel_job:
-                        return 0
-                    seg = self._seg_savename(idx)
-                    if not os.path.exists(seg):
-                        if not self._cancel_job:
-                            print(f"\n片段 {idx} 遺失, 合成失敗!!!", flush=True)
-                        return 0
-                    with storage_open(seg, 'rb') as f:
-                        shutil.copyfileobj(f, out, 1024 * 1024)
-                    remaining -= 1
-                    print(f'\r合成影片中, 剩餘 {remaining} 個片段', end="")
-            print()
-            if self._cancel_job:
-                return 0
+            for idx in range(n):
+                if self._cancel_job:
+                    return 0
+                if not os.path.exists(self._seg_savename(idx)):
+                    if not self._cancel_job:
+                        print(f"\n片段 {idx} 遺失, 合成失敗!!!", flush=True)
+                    return 0
 
-            ok = self._remux_to_mp4(merged, out_mp4, workdir)
+            # ffmpeg concat-demuxes straight from the segment files, so there's
+            # no separate full-size merged.ts pass before the remux (segments
+            # are read once, final mp4 written once, instead of an extra
+            # read+write of the whole video in between).
+            ok = self._remux_to_mp4(n, out_mp4, workdir)
             if self._cancel_job:
                 return 0
             if ok:
                 moved = self._cancellable_move(out_mp4, part)
             else:
                 print('[合成] ffmpeg 無法使用或重新封裝失敗，改用原始合併（檔案可播放，但部分播放器/NAS 拖曳進度可能異常）', flush=True)
+                merged = os.path.join(workdir, 'merged.ts')
+                if not self._concat_segments_raw(n, merged):
+                    return 0
                 moved = self._cancellable_move(merged, part)
             if self._cancel_job or not moved:
                 if os.path.exists(part):
@@ -861,7 +864,9 @@ class M3U8Crawler:
             try:
                 os.replace(part, saveName)
             except OSError as exc:
-                raise StorageWriteError(saveName, exc) from exc
+                if is_destination_fatal(exc):
+                    raise StorageWriteError(saveName, exc) from exc
+                raise
             published = True
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -877,17 +882,44 @@ class M3U8Crawler:
             except OSError: pass
         return spent_time
 
-    def _remux_to_mp4(self, merged_ts, out_mp4, workdir):
+    def _write_concat_list(self, n, list_path):
+        """Write an ffmpeg concat-demuxer list pointing at the segment files
+        in place, so remux can read them directly without a merged.ts copy."""
+        with storage_open(list_path, 'w', encoding='utf-8') as f:
+            for idx in range(n):
+                seg = os.path.abspath(self._seg_savename(idx))
+                escaped = seg.replace('\\', '\\\\').replace("'", "\\'")
+                f.write(f"file '{escaped}'\n")
+
+    def _concat_segments_raw(self, n, merged_path):
+        """Fallback used only when ffmpeg is unavailable: raw byte-concat the
+        segments into one .ts (playable, but without an MP4 remux/faststart)."""
+        remaining = n
+        with storage_open(merged_path, 'wb') as out:
+            for idx in range(n):
+                if self._cancel_job:
+                    return False
+                with storage_open(self._seg_savename(idx), 'rb') as f:
+                    shutil.copyfileobj(f, out, 1024 * 1024)
+                remaining -= 1
+                print(f'\r合成影片中, 剩餘 {remaining} 個片段', end="")
+        print()
+        return True
+
+    def _remux_to_mp4(self, n, out_mp4, workdir):
         ffmpeg = locate_ffmpeg()
         if not ffmpeg:
             print('[合成] 找不到 ffmpeg，略過重新封裝', flush=True)
             return False
+        list_path = os.path.join(workdir, 'concat.txt')
+        self._write_concat_list(n, list_path)
         ff_dir = _ffmpeg_safe_dir(workdir)
-        in_arg = os.path.join(ff_dir, os.path.basename(merged_ts))
+        list_arg = os.path.join(ff_dir, os.path.basename(list_path))
         out_arg = os.path.join(ff_dir, os.path.basename(out_mp4))
         log_path = os.path.join(workdir, 'ffmpeg.log')
         cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
-               '-fflags', '+genpts', '-i', in_arg,
+               '-fflags', '+genpts', '-f', 'concat', '-safe', '0',
+               '-i', list_arg,
                '-c', 'copy', '-movflags', '+faststart',
                '-avoid_negative_ts', 'make_zero', out_arg]
         print('正在重新封裝為可正常拖曳的 MP4 ...', flush=True)
@@ -917,7 +949,9 @@ class M3U8Crawler:
             if proc.returncode == 0 and os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
                 return True
         except OSError as exc:
-            raise StorageWriteError(out_mp4, exc) from exc
+            if is_destination_fatal(exc):
+                raise StorageWriteError(out_mp4, exc) from exc
+            raise
         tail = ''
         try:
             with storage_open(log_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -973,7 +1007,9 @@ class M3U8Crawler:
             try:
                 os.replace(part, saveName)
             except OSError as exc:
-                raise StorageWriteError(saveName, exc) from exc
+                if is_destination_fatal(exc):
+                    raise StorageWriteError(saveName, exc) from exc
+                raise
             with self._speed_lock:
                 self._pending_set.discard((seq_num, url))
                 self._bytes_downloaded += len(content_ts)

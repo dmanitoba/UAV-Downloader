@@ -105,8 +105,12 @@ def test_remux_workspace_uses_the_download_destination_volume(
         workspace.mkdir(parents=True)
         return str(workspace)
 
-    def fake_remux(merged, output, _workdir):
-        shutil.copyfile(merged, output)
+    def fake_remux(n, output, _workdir):
+        # Simulate ffmpeg's concat demuxer reading the segment files directly.
+        with open(output, 'wb') as out:
+            for idx in range(n):
+                with open(crawler._seg_savename(idx), 'rb') as f:
+                    out.write(f.read())
         return True
 
     monkeypatch.setattr(
