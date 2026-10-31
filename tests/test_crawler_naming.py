@@ -105,8 +105,13 @@ def test_remux_workspace_uses_the_download_destination_volume(
         workspace.mkdir(parents=True)
         return str(workspace)
 
-    def fake_remux(n, output, _workdir):
+    def fake_remux(n, output, _workdir, moov_reserve=None):
         # Simulate ffmpeg's concat demuxer reading the segment files directly.
+        # moov_reserve is the index budget that lets the real remux write the
+        # mp4 in one pass; it is accepted (and asserted on) rather than
+        # ignored, so this double keeps failing if that call ever regresses to
+        # the two-pass +faststart form.
+        assert moov_reserve, 'merge must request a single-pass index budget'
         with open(output, 'wb') as out:
             for idx in range(n):
                 with open(crawler._seg_savename(idx), 'rb') as f:

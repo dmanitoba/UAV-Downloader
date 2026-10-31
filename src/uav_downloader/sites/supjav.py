@@ -17,6 +17,7 @@ try:
 except ImportError:
     _use_cffi = False
 import threading as _threading
+import concurrent.futures as _futures
 from urllib.parse import quote, urlsplit, urljoin, parse_qsl, urlencode
 from uav_downloader.sites.base import *
 from uav_downloader.sites.base import _get_session, _variant_height_bw
@@ -469,10 +470,26 @@ class SiteSupJav(M3U8Crawler):
             # failed) sorts after every mirror with a known height but keeps
             # its relative position among other unknowns, so behavior is
             # unchanged when no mirror's quality can be determined at all.
+            #
+            # Probed concurrently: these are independent hosts, so the
+            # probes have no reason to wait on each other, and done serially
+            # a page with six resolvable mirrors could add six 15s timeouts
+            # (a minute and a half) before the download even starts. Ranking
+            # still consumes the results in the original mirror order, so a
+            # tie between two equal-height mirrors resolves the same way it
+            # would have serially - the concurrency is not observable in the
+            # outcome, only in how long it takes.
             if len(self._hls_sources) > 1:
+                with _futures.ThreadPoolExecutor(
+                        max_workers=min(len(self._hls_sources), 6)) as probe_pool:
+                    heights = list(probe_pool.map(
+                        lambda source: self._probe_source_height(
+                            scraper, source[1], source[2]),
+                        self._hls_sources))
                 ranked = [
-                    (name, url, src_headers, self._probe_source_height(scraper, url, src_headers))
-                    for name, url, src_headers in self._hls_sources
+                    (name, url, src_headers, height)
+                    for (name, url, src_headers), height
+                    in zip(self._hls_sources, heights)
                 ]
                 ranked.sort(key=lambda item: (item[3] is None, -(item[3] or 0)))
                 self._hls_sources = [(name, url, src_headers) for name, url, src_headers, _height in ranked]

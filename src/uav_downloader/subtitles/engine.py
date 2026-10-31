@@ -42,6 +42,7 @@ from uav_downloader.core.storage import (
 from uav_downloader.core.paths import product_data_dir
 from uav_downloader.metadata import PRODUCT_NAME
 from uav_downloader.sites.base import locate_ffmpeg
+from uav_downloader.core.iopacing import deprioritize
 from uav_downloader.core.ssl import SharedSSLAdapter
 from uav_downloader.core.video_identity import normalize_source_subtitle_evidence
 
@@ -1498,6 +1499,10 @@ def _run_process(args: list[str], log_path: str,
                 stderr=subprocess.STDOUT, creationflags=creationflags, cwd=cwd)
         except (OSError, ValueError) as exc:
             raise SubtitleError('Subtitle process could not start') from exc
+        # Local fork addition: audio extraction and ASR are long batch jobs
+        # that will happily saturate every core; they must yield to
+        # interactive work - see uav_downloader.core.iopacing.
+        deprioritize(process)
         try:
             _wait_for_process(
                 process,

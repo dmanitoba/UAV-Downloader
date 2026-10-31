@@ -18,6 +18,7 @@ import m3u8
 from uav_downloader.core import config
 from uav_downloader.core.storage import (
     StorageWriteError, storage_open, is_destination_fatal)
+from uav_downloader.core.iopacing import deprioritize
 from Crypto.Cipher import AES
 from uav_downloader.core.config import headers
 import concurrent.futures
@@ -290,6 +291,46 @@ speed_limiter = _SpeedLimiter()
 def _is_valid_ts_segment(data):
     return bool(data and len(data) >= 188 and data[:1] == b'\x47')
 
+
+# Local fork addition, not upstream. Budget for the mp4 index (moov atom) so
+# it can be written straight to the front of the file in ONE pass, instead of
+# `-movflags +faststart` re-reading and rewriting the entire finished mp4 to
+# move it there (ffmpeg's own help for faststart: "Run a second pass to put
+# the index (moov atom) at the beginning of the file"). That second pass costs
+# a full extra read AND write of a multi-GB file - measured on this fork at
+# 3.33 GiB written for a 1.71 GiB output, versus 1.61 GiB with a reservation.
+#
+# moov size tracks the SAMPLE COUNT, so it scales with duration x frame rate,
+# not with file size or bitrate - measured at a very stable ~45 bytes/frame
+# (1050-1350 bytes/sec at 30fps) across a 2.5 GiB-7.8 GiB sample, whose
+# largest moov was 18.5 MiB for a 4-hour video. 4096 bytes/sec therefore keeps
+# ~3x headroom at 30fps and still ~1.5x for 60fps content.
+#
+# Over-reserving is cheap and under-reserving is not, hence the generous rate:
+# unused reservation is left behind as a `free` atom (~0.7% of a typical file
+# here), while an overflow is only detected when the trailer is written, at
+# the very END of the pass, forcing a full `+faststart` retry - i.e. slower
+# than never having tried. _remux_to_mp4 handles that fallback, so a miss is
+# correct either way, just not free.
+_MOOV_RESERVE_BYTES_PER_SECOND = 4096
+_MOOV_RESERVE_MIN = 4 << 20
+_MOOV_RESERVE_MAX = 64 << 20
+# Fallback when the playlist carried no usable EXTINF durations: 0.5% of the
+# payload, which clears the tightest total/moov ratio observed (1/154) with
+# room to spare.
+_MOOV_RESERVE_SIZE_FRACTION = 200
+
+# ffmpeg reports an under-sized reservation like
+#   [mp4 @ ...] reserved_moov_size is too small, needed 1995874 additional
+_MOOV_OVERFLOW_RE = re.compile(r'reserved_moov_size is too small',
+                               re.IGNORECASE)
+
+# A remux workdir older than this cannot belong to a live job, so its partial
+# out.mp4 is reclaimable. Generous because a slow multi-GB remux on a loaded
+# machine legitimately takes a long time, and the only cost of waiting is
+# leaving dead bytes on disk a while longer.
+_STALE_REMUX_AGE_SECONDS = 6 * 3600
+
 _FFMPEG_PATH = None
 _FFMPEG_RESOLVED = False
 
@@ -538,6 +579,7 @@ class M3U8Crawler:
         self._t2_executor = None
         self._cancel_job = None
         self._ffmpeg_proc = None
+        self._remux_moov_overflow = False
         self._extra_headers = {}   # subclass may set (e.g. Referer)
         self._dirName = None
         self._dest_folder = None
@@ -545,6 +587,7 @@ class M3U8Crawler:
         self._targetName = None
         self._imageUrl = None
         self._m3u8url = None
+        self._total_duration = 0.0
         if max_workers is None:
             max_workers = config.get_max_workers_per_video()
         normalized_workers = config.normalize_max_workers_per_video(max_workers)
@@ -747,8 +790,18 @@ class M3U8Crawler:
         self._media_sequence = getattr(m3u8obj, 'media_sequence', 0) or 0
         # Build segment URL list
         self._tsList = []
+        # Local fork addition: total EXTINF duration, used to budget the mp4
+        # index up front so the remux needs only one pass - see
+        # _MOOV_RESERVE_BYTES_PER_SECOND. Best-effort: a playlist with
+        # unusable durations just falls back to a size-derived estimate.
+        total_duration = 0.0
         for seg in m3u8obj.segments:
             self._tsList.append(urljoin(downloadurl, seg.uri))
+            try:
+                total_duration += float(seg.duration or 0)
+            except (TypeError, ValueError):
+                pass
+        self._total_duration = total_duration
         if not self._tsList:
             raise Exception("m3u8 無有效片段（可能被阻擋或改版）")
 
@@ -776,9 +829,15 @@ class M3U8Crawler:
     def _deleteMp4Chunks(self):
         for i in range(len(self._tsList)):
             saveName = self._seg_savename(i)
-            if os.path.exists(saveName):
-                try: os.remove(saveName)
-                except OSError: pass
+            # `.part` too: _scrape writes each segment to one and renames it
+            # into place, so a segment whose write failed partway leaves a
+            # `.part` behind. Those were never cleaned up, which also meant
+            # the temp folder was never empty and so survived the rmdir
+            # below - stranding the whole directory, not just the stray file.
+            for path in (saveName, saveName + '.part'):
+                if os.path.exists(path):
+                    try: os.remove(path)
+                    except OSError: pass
 
     def _cancellable_move(self, src, dst):
         """Move src->dst honoring cancel. Fast same-volume rename, else chunked copy."""
@@ -823,6 +882,7 @@ class M3U8Crawler:
         # volume.  Windows' default temp directory normally lives on C:, and
         # using it here could consume almost two extra copies of a video after
         # the segment progress had already reached 100%.
+        self._sweep_stale_remux_dirs()
         try:
             workdir = tempfile.mkdtemp(
                 prefix='uav-remux-', dir=self._dest_folder)
@@ -833,10 +893,14 @@ class M3U8Crawler:
         out_mp4 = os.path.join(workdir, 'out.mp4')
         published = False
         try:
+            payload_bytes = 0
             for idx in range(n):
                 if self._cancel_job:
                     return 0
-                if not os.path.exists(self._seg_savename(idx)):
+                seg = self._seg_savename(idx)
+                try:
+                    payload_bytes += os.path.getsize(seg)
+                except OSError:
                     if not self._cancel_job:
                         print(f"\n片段 {idx} 遺失, 合成失敗!!!", flush=True)
                     return 0
@@ -845,7 +909,14 @@ class M3U8Crawler:
             # no separate full-size merged.ts pass before the remux (segments
             # are read once, final mp4 written once, instead of an extra
             # read+write of the whole video in between).
-            ok = self._remux_to_mp4(n, out_mp4, workdir)
+            reserve = self._moov_reserve_bytes(payload_bytes)
+            ok = self._remux_to_mp4(n, out_mp4, workdir, moov_reserve=reserve)
+            if not ok and not self._cancel_job and self._remux_moov_overflow:
+                # The index outgrew its budget, which is only discovered while
+                # writing the trailer. Retry the slow way rather than publish
+                # nothing - see _MOOV_RESERVE_BYTES_PER_SECOND.
+                print('[合成] 索引空間不足，改用 faststart 重試', flush=True)
+                ok = self._remux_to_mp4(n, out_mp4, workdir, moov_reserve=None)
             if self._cancel_job:
                 return 0
             if ok:
@@ -878,9 +949,70 @@ class M3U8Crawler:
         print(f'\n合成完成，花費 {spent_time:.1f} 秒', flush=True)
         self._deleteMp4Chunks()
         if self._temp_folder != self._dest_folder:
-            try: os.removedirs(self._temp_folder)
+            # rmdir, not removedirs: removedirs also prunes empty PARENTS,
+            # walking up past the download folder itself. It is only harmless
+            # today because the finished .mp4 happens to keep the parent
+            # non-empty; point two jobs at an otherwise-empty tree and it
+            # deletes directories it was never asked to touch.
+            try: os.rmdir(self._temp_folder)
             except OSError: pass
         return spent_time
+
+    def _sweep_stale_remux_dirs(self):
+        """Reclaim remux workdirs abandoned by a killed/crashed run.
+
+        Local fork addition, not upstream. _mergeMp4Chunks removes its own
+        workdir in a `finally`, which covers every outcome EXCEPT the process
+        not living to run it - SIGKILL, an OOM kill, a crash or a power cut
+        mid-remux. The partial out.mp4 left behind is then never looked at
+        again by anything (a rerun re-muxes from the segments and makes a
+        fresh workdir), so it is pure dead weight for the life of the drive -
+        one was found here holding 3.3 GB.
+
+        Only our own `uav-remux-` prefix is touched, and only once it is far
+        too old to belong to a live job, so a concurrent remux - including one
+        from a second UAV instance - is never disturbed. The segment temp
+        folders are deliberately left alone: those ARE resume state, and
+        deleting them would silently throw away a partial download.
+        """
+        dest = getattr(self, '_dest_folder', None)
+        if not dest:
+            return
+        cutoff = time.time() - _STALE_REMUX_AGE_SECONDS
+        try:
+            names = os.listdir(dest)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith('uav-remux-'):
+                continue
+            path = os.path.join(dest, name)
+            try:
+                if not os.path.isdir(path) or os.path.getmtime(path) > cutoff:
+                    continue
+                reclaimed = sum(
+                    os.path.getsize(os.path.join(path, f))
+                    for f in os.listdir(path)
+                    if os.path.isfile(os.path.join(path, f)))
+            except OSError:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path) and reclaimed:
+                print(f'[合成] 清理殘留暫存 {name}（釋放 '
+                      f'{reclaimed / (1 << 30):.2f} GB）', flush=True)
+
+    def _moov_reserve_bytes(self, payload_bytes):
+        """Bytes to reserve for the mp4 index - see
+        _MOOV_RESERVE_BYTES_PER_SECOND for how the rate was derived."""
+        duration = 0.0
+        try:
+            duration = float(getattr(self, '_total_duration', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        estimate = duration * _MOOV_RESERVE_BYTES_PER_SECOND
+        if estimate <= 0:
+            estimate = payload_bytes / _MOOV_RESERVE_SIZE_FRACTION
+        return int(max(_MOOV_RESERVE_MIN, min(_MOOV_RESERVE_MAX, estimate)))
 
     def _write_concat_list(self, n, list_path):
         """Write an ffmpeg concat-demuxer list pointing at the segment files
@@ -906,7 +1038,16 @@ class M3U8Crawler:
         print()
         return True
 
-    def _remux_to_mp4(self, n, out_mp4, workdir):
+    def _remux_to_mp4(self, n, out_mp4, workdir, moov_reserve=None):
+        """Concat-demux the segments into one mp4 with the index at the front.
+
+        `moov_reserve` (bytes) budgets that index up front so it is written in
+        place during the single muxing pass; passing None falls back to
+        `-movflags +faststart`, which gets the same layout by re-reading and
+        rewriting the whole finished file. See
+        _MOOV_RESERVE_BYTES_PER_SECOND.
+        """
+        self._remux_moov_overflow = False
         ffmpeg = locate_ffmpeg()
         if not ffmpeg:
             print('[合成] 找不到 ffmpeg，略過重新封裝', flush=True)
@@ -917,10 +1058,12 @@ class M3U8Crawler:
         list_arg = os.path.join(ff_dir, os.path.basename(list_path))
         out_arg = os.path.join(ff_dir, os.path.basename(out_mp4))
         log_path = os.path.join(workdir, 'ffmpeg.log')
+        index_args = (['-moov_size', str(int(moov_reserve))] if moov_reserve
+                      else ['-movflags', '+faststart'])
         cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                '-fflags', '+genpts', '-f', 'concat', '-safe', '0',
                '-i', list_arg,
-               '-c', 'copy', '-movflags', '+faststart',
+               '-c', 'copy'] + index_args + [
                '-avoid_negative_ts', 'make_zero', out_arg]
         print('正在重新封裝為可正常拖曳的 MP4 ...', flush=True)
         try:
@@ -929,6 +1072,10 @@ class M3U8Crawler:
                                         stdout=subprocess.DEVNULL, stderr=errf,
                                         **_no_window_kwargs())
                 self._ffmpeg_proc = proc
+                # Local fork addition: a remux is batch work that must not
+                # make the rest of the machine crawl - see
+                # uav_downloader.core.iopacing.
+                deprioritize(proc)
                 try:
                     while True:
                         try:
@@ -960,6 +1107,17 @@ class M3U8Crawler:
             raise
         except Exception:
             pass
+        # Checked BEFORE storage_failure below, which is not merely an
+        # ordering preference: an under-sized reservation fails while writing
+        # the trailer and ffmpeg reports it as "Error writing trailer:
+        # Invalid argument", which the `error (?:writing|closing)` branch of
+        # that regex matches. Left to fall through it would be reported as a
+        # dead destination volume and cancel every other in-flight download
+        # on it, over nothing worse than a too-small index budget that the
+        # caller can simply retry.
+        if moov_reserve and _MOOV_OVERFLOW_RE.search(tail):
+            self._remux_moov_overflow = True
+            return False
         storage_failure = re.search(
             r'no space left|disk (?:is )?full|input/output error|'
             r'i/o error|device (?:is )?not ready|no such device|'
